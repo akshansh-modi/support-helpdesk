@@ -138,6 +138,7 @@ import {
   useTicket,
   type PinnedComment,
 } from "@/composables/useTicket";
+import { getUserEmailInfo } from "@/composables/useUserEmailInfo"; // crm-desk patch, see PATCHES.md
 import { useAuthStore } from "@/stores/auth";
 import { globalStore } from "@/stores/globalStore";
 import { useUserStore } from "@/stores/user";
@@ -186,6 +187,7 @@ const authStore = useAuthStore();
 const { getUser } = useUserStore();
 const { $socket } = globalStore();
 const ticket = inject(TicketSymbol)!;
+const userEmailInfo = getUserEmailInfo(); // crm-desk patch, see PATCHES.md
 
 const splitCommunication = ref("");
 const timelineRef =
@@ -354,32 +356,64 @@ function showSplitOption(activity: EmailActivity): boolean {
   return !isFirstEmail(activity) && ticket.value?.doc?.status !== "Closed";
 }
 
+// crm-desk patch, see PATCHES.md: compare bare addresses, so '"Support" <a@b.com>' matches 'a@b.com'
+const emailAddress = (s: string) =>
+  (String(s).match(/<([^>]+)>/)?.[1] || String(s)).trim().toLowerCase();
+
+// crm-desk patch, see PATCHES.md: our own addresses are the session user, their email and the
+// helpdesk's inboxes, so replies never go back to the support inbox.
+const ownAddresses = () =>
+  [
+    authStore.userId,
+    getUser(authStore.userId)?.email,
+    userEmailInfo.data?.email,
+    ...(userEmailInfo.data?.helpdesk_emails || []),
+  ]
+    .filter(Boolean)
+    .map(emailAddress);
+
 // sender is an email address; userId may be the raw session user
 function isSelf(email: string): boolean {
-  return (
-    authStore.userId === email || getUser(authStore.userId)?.email === email
-  );
+  return ownAddresses().includes(emailAddress(email));
 }
+
+// Never leave To empty: fall back to the ticket's customer. crm-desk patch, see PATCHES.md
+const withFallback = (list: string[]) =>
+  list.length ? list : [ticket.value?.doc?.raised_by].filter(Boolean);
 
 function reply(activity: EmailActivity) {
   const { sender, content } = activity.data;
   emit("email:reply", {
     content,
-    to: isSelf(sender) ? activity.data.to : sender,
+    to: withFallback(
+      splitRecipients(isSelf(sender) ? activity.data.to : sender, ownAddresses())
+    ).join(", "),
   });
 }
 
 function replyAll(activity: EmailActivity) {
   const { sender, to, cc, bcc, content } = activity.data;
-  const exclude = [authStore.userId, getUser(authStore.userId)?.email, sender];
+  const exclude = [...ownAddresses(), sender];
   const filteredTo = splitRecipients(to, exclude);
   const filteredCc = splitRecipients(cc, exclude);
   const filteredBcc = splitRecipients(bcc, exclude);
-  const isSender = isSelf(sender);
+  if (isSelf(sender)) {
+    // If we were the only one in To, the Cc people (e.g. the customer) become the To.
+    // crm-desk patch, see PATCHES.md
+    const toList = withFallback(filteredTo.length ? filteredTo : filteredCc);
+    const toAddresses = toList.map(emailAddress);
+    emit("email:reply", {
+      content,
+      to: toList.join(", "),
+      cc: filteredCc.filter((x) => !toAddresses.includes(emailAddress(x))),
+      bcc: filteredBcc,
+    });
+    return;
+  }
   emit("email:reply", {
     content,
-    to: isSender ? filteredTo.join(", ") : sender,
-    cc: isSender ? filteredCc : [...filteredTo, ...filteredCc],
+    to: sender,
+    cc: [...filteredTo, ...filteredCc],
     bcc: filteredBcc,
   });
 }
@@ -404,7 +438,10 @@ function splitRecipients(
     }
   }
   if (current) parts.push(current.trim());
-  return parts.filter(Boolean).filter((item) => !exclude.includes(item));
+  const excluded = exclude.filter(Boolean).map(emailAddress); // crm-desk patch, see PATCHES.md
+  return parts
+    .filter(Boolean)
+    .filter((item) => !excluded.includes(emailAddress(item)));
 }
 
 // deep links arrive as ?highlight=comment-<name> / communication-<name>;
